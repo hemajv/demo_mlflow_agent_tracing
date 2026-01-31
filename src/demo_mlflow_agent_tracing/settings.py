@@ -21,7 +21,7 @@ class Settings(BaseSettings):
     EMBEDDING_API_KEY: Optional[SecretStr] = Field(None, description="API key for authenticating with the server")
     EMBEDDING_MODEL_NAME: Optional[str] = Field(None, description="Name of the model to use (e.g. `nomic-embed-text`)")
     EMBEDDING_BASE_URL: Optional[str] = Field(None, description="Base URL of the server")
-    EMBEDDING_DOCUMENT_PREFIX: Optional[str] = Field("", description="Prefix for embeddings for documents")
+    #EMBEDDING_DOCUMENT_PREFIX: Optional[str] = Field("", description="Prefix for embeddings for documents")
     EMBEDDING_SEARCH_PREFIX: Optional[str] = Field("", description="Prefix for embeddings for search queries")
 
     # Chainlit
@@ -34,6 +34,7 @@ class Settings(BaseSettings):
     MLFLOW_TRACKING_URI: Optional[str] = Field(None, description="MLFlow Tracking URI")
     MLFLOW_EXPERIMENT_NAME: Optional[str] = Field(None, description="MLFlow Experiment Name")
     MLFLOW_SYSTEM_PROMPT_URI: Optional[str] = Field(None, description="MLFlow Prompt URI (e.g. prompts:/my-prompt@latest)")
+    EVAL_DATASET_NAME: Optional[str] = Field(None, description="MLflow evaluation dataset name (used by scripts/evals.py)")
 
     @property
     def openai_enabled(self) -> bool:
