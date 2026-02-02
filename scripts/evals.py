@@ -148,9 +148,10 @@ def main() -> None:
 
     async def run_eval() -> None:
         # Same RAG agent as the app: embedding model + document DB + search tool + LLM
+        model = f"openai:/{settings.OPENAI_MODEL_NAME}"
         agent = await build_agent()
         scorers = [
-            Correctness(name="factual_accuracy"),  # uses expectations.expected_response
+            Correctness(model=model),  # uses expectations.expected_response
             ground_truth_exact_match,               # uses expectations.expected_response
             ground_truth_contains,                  # uses expectations.expected_response
             expected_document_mentioned,            # uses expectations.expected_document
