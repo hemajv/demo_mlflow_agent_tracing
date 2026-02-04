@@ -1,197 +1,167 @@
 """RAG evaluation: run the same agent as the app on an eval dataset and score vs ground truth.
 
-Flow:
-  1. Agent (agent.py) is a RAG agent: it uses an embedding model + document database and
-     only answers from those documents (search → retrieve → answer).
-  2. Eval dataset has N questions (e.g. 20) with ground-truth answers derived from the
-     same documents.
-  3. For each question we run the same agent: it searches the documents and returns an
-     answer.
-  4. Eval metrics compare each answer to the ground truth (correctness, exact match,
-     contains).
-
-We run the eval agent on each eval dataset question, collect the response, then
-MLflow evaluates that response against the expected answer from the dataset.
+Uses MLflow's evaluate() with predict_fn so that:
+  - The agent is invoked per row and returns the full state (messages, tool calls).
+  - Scorers receive structured outputs and can evaluate retrieval (did the right doc get
+    retrieved?) and answer quality (Correctness, Completeness, Relevance).
 
 Dataset schema (per record):
   - inputs: {"question": "Where are travelers required to check-in when travelling for OSCORP?"}
-  - expectations: {"expected_response": "They may only use the Shadow Terminal...", "expected_document": "travel.md"}
+  - expectations: {"expected_response": "...", "expected_document": "travel.md"}
 """
 
 import asyncio
 import logging
-import uuid
+from typing import Any
+from uuid import uuid4
 
 import mlflow
-from mlflow.genai import evaluate
-from mlflow.genai.datasets import search_datasets
-from mlflow.genai.scorers import Correctness, scorer
-
-from demo_mlflow_agent_tracing.agent import build_agent
-from demo_mlflow_agent_tracing.base import ContextSchema
+from demo_mlflow_agent_tracing.agent import build_agent, format_config, format_context, format_input
+from demo_mlflow_agent_tracing.mcp_server import SearchResult
 from demo_mlflow_agent_tracing.settings import Settings
+from dotenv import load_dotenv
+from langchain_core.messages import AIMessage, BaseMessage, ToolMessage
+from mlflow import MlflowClient
+from mlflow.entities import Feedback
+from mlflow.genai import evaluate
+from mlflow.genai.scorers import Completeness, Correctness, RelevanceToQuery, scorer
+
+mlflow.langchain.autolog(run_tracer_inline=True)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(name)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-@scorer(name="ground_truth_exact_match", description="1.0 if model output exactly matches expected_response (case-insensitive, stripped), else 0.0")
-def ground_truth_exact_match(outputs: str, expectations: dict) -> float:
-    """Score 1.0 when output exactly matches ground truth, else 0.0."""
-    expected = expectations.get("expected_response")
-    if expected is None:
-        return 0.0
-    return 1.0 if (outputs or "").strip().lower() == str(expected).strip().lower() else 0.0
+
+def get_messages(outputs: dict[str, Any]) -> list[BaseMessage]:
+    """Get messages from agent outputs."""
+    return outputs.get("messages", [])
 
 
-@scorer(name="ground_truth_contains", description="1.0 if expected_response appears in model output (case-insensitive), else 0.0")
-def ground_truth_contains(outputs: str, expectations: dict) -> float:
-    """Score 1.0 when ground truth is contained in the output, else 0.0."""
-    expected = expectations.get("expected_response")
-    if expected is None:
-        return 0.0
-    return 1.0 if str(expected).strip().lower() in (outputs or "").strip().lower() else 0.0
+def get_tool_calls(outputs: dict[str, Any]) -> list[tuple[dict[str, Any], ToolMessage]]:
+    """Parse tool call and response pairs from outputs."""
+    messages = get_messages(outputs)
+    ai_messages: list[AIMessage] = [m for m in messages if isinstance(m, AIMessage)]
+    tool_messages: list[ToolMessage] = [m for m in messages if isinstance(m, ToolMessage)]
+    tool_calls: list[dict[str, Any]] = sum(
+        [m.tool_calls for m in ai_messages if m.tool_calls], start=[]
+    )
+    pairs: list[tuple[dict[str, Any], ToolMessage]] = []
+    for tc in tool_calls:
+        tid = tc.get("id")
+        resp = next((m for m in tool_messages if m.tool_call_id == tid), None)
+        if resp is not None:
+            pairs.append((tc, resp))
+    return pairs
 
 
-@scorer(name="expected_document_mentioned", description="1.0 if expected_document (e.g. travel.md) appears in model output, else 0.0")
-def expected_document_mentioned(outputs: str, expectations: dict) -> float:
-    """Score 1.0 when the expected source document is mentioned in the output."""
-    expected_doc = expectations.get("expected_document")
-    if not expected_doc:
-        return 1.0  # no expectation = pass
-    out = (outputs or "").strip().lower()
-    # Match document name with or without extension (e.g. travel.md or travel)
-    doc_name = str(expected_doc).strip().lower().removesuffix(".md")
-    return 1.0 if doc_name in out or expected_doc.strip().lower() in out else 0.0
+def get_retrieved_documents(outputs: dict[str, Any]) -> list[str]:
+    """Parse retrieved document names from tool responses."""
+    pairs = get_tool_calls(outputs)
+    names: list[str] = []
+    for _tc, response in pairs:
+        raw = getattr(response, "artifact", None) or {}
+        if isinstance(raw, dict):
+            structured = raw.get("structured_content", {})
+        else:
+            structured = {}
+        if not structured:
+            continue
+        try:
+            search_result = SearchResult.model_validate(structured)
+            for doc in search_result.documents:
+                names.append(doc.metadata.get("file", ""))
+        except Exception:
+            pass
+    return names
 
 
-def _row_to_inputs_expectations(row) -> tuple[dict, dict]:
-    """Extract inputs and expectations from a dataset row.
-
-    Dataset schema we support:
-      - inputs: {"question": "..."}
-      - expectations: {"expected_response": "...", "expected_document": "travel.md"}
-    Handles both dict columns and flattened columns (e.g. inputs.question).
-    """
-    inputs = row.get("inputs")
-    expectations = row.get("expectations")
-    if not isinstance(inputs, dict):
-        # Flattened columns, e.g. row["inputs.question"]
-        question = row.get("inputs.question", row.get("question", ""))
-        inputs = {"question": question} if question else {}
-    if not isinstance(expectations, dict):
-        exp_resp = row.get("expectations.expected_response", row.get("expected_response"))
-        exp_doc = row.get("expectations.expected_document", row.get("expected_document"))
-        expectations = {}
-        if exp_resp is not None:
-            expectations["expected_response"] = exp_resp
-        if exp_doc is not None:
-            expectations["expected_document"] = exp_doc
-    return inputs or {}, expectations or {}
-
-
-def _content_to_str(content: str | list) -> str:
-    """Normalize token content to string (content can be str or list of content blocks)."""
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        return "".join(
-            block.get("text", block) if isinstance(block, dict) else str(block)
-            for block in content
+@scorer(name="Retrieval")
+def retrieval_score(outputs: dict[str, Any], expectations: dict[str, Any]) -> Feedback:
+    """Check if the expected document was retrieved during the conversation."""
+    expected_document = expectations.get("expected_document")
+    if expected_document is None:
+        return Feedback(value="yes", rationale="No expected document provided")
+    try:
+        retrieved = get_retrieved_documents(outputs)
+        if expected_document in retrieved:
+            return Feedback(value="yes", rationale="Expected document was retrieved by tool calls")
+        return Feedback(value="no", rationale="Expected document was not retrieved by tool calls")
+    except Exception as e:
+        logger.error("Error parsing outputs for retrieval score: %s", e)
+        return Feedback(
+            value="no",
+            rationale=f"There was an error parsing the outputs: {e!s}",
+            error=e,
         )
-    return str(content) if content else ""
 
 
-async def run_agent(agent, question: str) -> str:
-    """Run the RAG agent on one question: it searches the document DB and returns the answer."""
-    messages = [{"role": "user", "content": question}]
-    config = {"configurable": {"thread_id": str(uuid.uuid4())}}
-    context = ContextSchema(user_info="eval")
-    input_state = {"messages": messages, "user_info": "eval"}
+async def run_agent(question: str) -> dict[str, Any]:
+    """Run the agent on one question; returns full state (messages, etc.) for scorers."""
+    user = "evals"
+    input_state = format_input(content=question, user_identifier=user)
+    config = format_config(thread_id=str(uuid4()))
+    context = format_context(user_identifier=user)
+    agent = await build_agent()
+    try:
+        response = await agent.ainvoke(input=input_state, config=config, context=context)
+        return response
+    except Exception as e:
+        logger.exception("Agent invocation failed for question=%r: %s", question[:80], e)
+        return {"status": "error", "message": str(e)}
 
-    final_content: list[str] = []
-    async for token, metadata in agent.astream(
-        input=input_state,
-        config=config,
-        context=context,
-        stream_mode="messages",
-    ):
-        if token.content:
-            final_content.append(_content_to_str(token.content))
 
-    return "".join(final_content) if final_content else ""
+def predict(question: str) -> dict[str, Any]:
+    """Sync predict_fn for MLflow evaluate: called as predict(question=...) from inputs dict."""
+    return asyncio.run(run_agent(question or ""))
 
 
 def main() -> None:
-    """Run RAG eval: for each question in the dataset, run the agent (search docs → answer), then score vs ground truth."""
+    """Run RAG eval using MLflow evaluate with predict_fn and full-state scorers."""
+    load_dotenv()
     settings = Settings()
     if settings.MLFLOW_TRACKING_URI:
         mlflow.set_tracking_uri(settings.MLFLOW_TRACKING_URI)
     if settings.MLFLOW_EXPERIMENT_NAME:
         mlflow.set_experiment(settings.MLFLOW_EXPERIMENT_NAME)
 
-    mlflow.autolog(disable=True)
-
     dataset_name = settings.EVAL_DATASET_NAME or "oscorp_policies_validation_set"
-    datasets = search_datasets(
-        filter_string=f"name = '{dataset_name}'",
-        max_results=1,
+    client = MlflowClient()
+    matched = client.search_datasets(
+        filter_string=f"name LIKE '{dataset_name}'",
+        max_results=5,
     )
-    if not datasets:
+    if not matched:
         raise SystemExit(
             f"Dataset '{dataset_name}' not found. Create and upload it first with: "
             "uv run python scripts/generate_eval_dataset.py"
         )
-    dataset = datasets[0]
-    df = dataset.to_df()
-    num_questions = len(df)
-    logger.info("Using dataset: %s (id=%s), %s questions", dataset.name, dataset.dataset_id, num_questions)
+    dataset = matched[0]
+    logger.info("Using dataset: %s", dataset.name)
 
-    async def run_eval() -> None:
-        # Same RAG agent as the app: embedding model + document DB + search tool + LLM
-        model = f"openai:/{settings.OPENAI_MODEL_NAME}"
-        agent = await build_agent()
-        scorers = [
-            Correctness(model=model),  # uses expectations.expected_response
-            ground_truth_exact_match,               # uses expectations.expected_response
-            ground_truth_contains,                  # uses expectations.expected_response
-            expected_document_mentioned,            # uses expectations.expected_document
-        ]
+    model = f"openai:/{settings.OPENAI_MODEL_NAME}"
+    scorers_list = [
+        Correctness(model=model),
+        Completeness(name="Completeness", model=model),
+        RelevanceToQuery(name="Relevance", model=model),
+        retrieval_score,
+    ]
 
-        # Dataset schema: inputs = {"question": "..."}, expectations = {"expected_response": "...", "expected_document": "travel.md"}
-        # For each question: run agent (searches documents, returns answer), then we score vs ground truth
-        eval_data = []
-        for idx, row in df.iterrows():
-            inputs, expectations = _row_to_inputs_expectations(row)
-            question = inputs.get("question", "")
-            try:
-                output = await run_agent(agent, question)
-            except Exception as e:
-                logger.exception("Prediction failed for question=%r: %s", question[:80], e)
-                raise
-            eval_data.append({"inputs": inputs, "outputs": output, "expectations": expectations})
-            logger.info("Prediction %s/%s done", len(eval_data), num_questions)
-
-        try:
-            results = evaluate(
-                data=eval_data,
-                scorers=scorers,
-            )
-            logger.info("Eval metrics: %s", results.metrics)
-            if "eval_results_table" in results.tables:
-                logger.info("Eval results table:\n%s", results.tables["eval_results_table"].to_string())
-        except Exception as e:
-            err = str(e).lower()
-            if any(
-                x in err
-                for x in ("503", "service unavailable", "application is not available", "not serving")
-            ):
-                raise SystemExit(
-                    "The model API at OPENAI_BASE_URL returned 503 (service unavailable). "
-                    "Ensure the model server is running and reachable, then re-run the eval."
-                ) from e
-            raise
-
-    asyncio.run(run_eval())
+    try:
+        results = evaluate(data=dataset, scorers=scorers_list, predict_fn=predict)
+        logger.info("Eval metrics: %s", results.metrics)
+        if "eval_results_table" in results.tables:
+            logger.info("Eval results table:\n%s", results.tables["eval_results_table"].to_string())
+    except Exception as e:
+        err = str(e).lower()
+        if any(
+            x in err
+            for x in ("503", "service unavailable", "application is not available", "not serving")
+        ):
+            raise SystemExit(
+                "The model API at OPENAI_BASE_URL returned 503 (service unavailable). "
+                "Ensure the model server is running and reachable, then re-run the eval."
+            ) from e
+        raise
 
 
 if __name__ == "__main__":
